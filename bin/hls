@@ -1,0 +1,229 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+require 'find'
+
+# HLS変換ツール
+class HLSConverter
+  DEFAULT_HLS_TIME = 1
+  DEFAULT_PLAYLIST_TYPE = 'vod'
+  VIDEO_EXTENSIONS = %w[.mp4 .mov .avi .mkv .flv .wmv .webm .m4v].freeze
+
+  def initialize
+    @options = {
+      video_codec: 'copy',
+      audio_codec: 'copy',
+      hls_time: DEFAULT_HLS_TIME,
+      playlist_type: DEFAULT_PLAYLIST_TYPE,
+      segment_filename: nil,
+      output: nil,
+      batch: false,
+      recursive: false,
+      output_dir: nil
+    }
+  end
+
+  def run(args)
+    parse_options(args)
+
+    if ARGV.empty?
+      puts 'エラー: 入力ファイルまたはディレクトリを指定してください'
+      puts
+      puts @opt_parser
+      exit 1
+    end
+
+    input_path = ARGV[0]
+    unless File.exist?(input_path)
+      puts "エラー: パスが見つかりません: #{input_path}"
+      exit 1
+    end
+
+    if File.directory?(input_path)
+      process_directory(input_path)
+    else
+      execute_ffmpeg(input_path)
+    end
+  end
+
+  private
+
+  def parse_options(args)
+    @opt_parser = OptionParser.new do |opts|
+      opts.banner = "使用方法: hls [オプション] 入力ファイル/ディレクトリ\n\n"
+      opts.banner += "HLS形式への動画変換ツール\n\n"
+
+      opts.on('-o', '--output OUTPUT', '出力するm3u8ファイル名 (デフォルト: 入力ファイル名.m3u8)') do |v|
+        @options[:output] = v
+      end
+
+      opts.on('-d', '--output-dir DIR', '出力先ディレクトリ (バッチ処理時)') do |v|
+        @options[:output_dir] = v
+      end
+
+      opts.on('-b', '--batch', '同一ディレクトリ内の動画ファイルを一括処理') do
+        @options[:batch] = true
+      end
+
+      opts.on('-r', '--recursive', 'サブディレクトリも再帰的に処理 (-bと併用)') do
+        @options[:recursive] = true
+      end
+
+      opts.on('-t', '--hls-time SECONDS', Integer, "セグメントの長さ (秒) (デフォルト: #{DEFAULT_HLS_TIME})") do |v|
+        @options[:hls_time] = v
+      end
+
+      opts.on('-p', '--playlist-type TYPE', String, "プレイリストタイプ (vod/event) (デフォルト: #{DEFAULT_PLAYLIST_TYPE})") do |v|
+        @options[:playlist_type] = v
+      end
+
+      opts.on('-s', '--segment-filename PATTERN', String, 'セグメントファイル名のパターン (例: segment%03d.ts)') do |v|
+        @options[:segment_filename] = v
+      end
+
+      opts.on('-v', '--video-codec CODEC', String, 'ビデオコーデック (デフォルト: copy)') do |v|
+        @options[:video_codec] = v
+      end
+
+      opts.on('-a', '--audio-codec CODEC', String, 'オーディオコーデック (デフォルト: copy)') do |v|
+        @options[:audio_codec] = v
+      end
+
+      opts.on('-h', '--help', 'このヘルプを表示') do
+        puts opts
+        exit
+      end
+    end
+
+    @opt_parser.parse!(args)
+  end
+
+  def process_directory(dir_path)
+    video_files = find_video_files(dir_path)
+
+    if video_files.empty?
+      puts "エラー: ディレクトリ内に動画ファイルが見つかりません: #{dir_path}"
+      exit 1
+    end
+
+    puts "#{video_files.size}個の動画ファイルを処理します"
+    puts
+
+    success_count = 0
+    fail_count = 0
+
+    video_files.each_with_index do |file, index|
+      puts "[#{index + 1}/#{video_files.size}] 処理中: #{file}"
+      begin
+        execute_ffmpeg(file, batch_mode: true)
+        success_count += 1
+      rescue StandardError => e
+        puts "エラー: #{file} の処理に失敗しました: #{e.message}"
+        fail_count += 1
+      end
+      puts
+    end
+
+    puts "=" * 50
+    puts "処理完了: 成功 #{success_count}件, 失敗 #{fail_count}件"
+  end
+
+  def find_video_files(dir_path)
+    files = []
+
+    if @options[:recursive]
+      Find.find(dir_path) do |path|
+        files << path if File.file?(path) && video_file?(path)
+      end
+    else
+      Dir.glob(File.join(dir_path, '*')).each do |path|
+        files << path if File.file?(path) && video_file?(path)
+      end
+    end
+
+    files.sort
+  end
+
+  def video_file?(file_path)
+    VIDEO_EXTENSIONS.include?(File.extname(file_path).downcase)
+  end
+
+  def execute_ffmpeg(input_file, batch_mode: false)
+    output_file = generate_output_path(input_file, batch_mode)
+    segment_file = generate_segment_path(output_file)
+
+    # 出力ディレクトリを作成
+    output_dir = File.dirname(output_file)
+    Dir.mkdir(output_dir) unless Dir.exist?(output_dir)
+
+    cmd = build_ffmpeg_command(input_file, output_file, segment_file)
+
+    puts "実行コマンド: #{cmd}" unless batch_mode
+    puts
+
+    system(cmd)
+    exit_code = $?.exitstatus
+
+    if exit_code == 0
+      puts "変換完了: #{output_file}"
+    else
+      error_msg = "ffmpegの実行に失敗しました (終了コード: #{exit_code})"
+      if batch_mode
+        raise error_msg
+      else
+        puts "エラー: #{error_msg}"
+        exit exit_code
+      end
+    end
+  end
+
+  def generate_output_path(input_file, batch_mode)
+    if @options[:output] && !batch_mode
+      @options[:output]
+    elsif @options[:output_dir]
+      base_name = File.basename(input_file, File.extname(input_file))
+      File.join(@options[:output_dir], "#{base_name}.m3u8")
+    else
+      input_dir = File.dirname(input_file)
+      base_name = File.basename(input_file, File.extname(input_file))
+      File.join(input_dir, "#{base_name}.m3u8")
+    end
+  end
+
+  def generate_segment_path(output_file)
+    if @options[:segment_filename]
+      output_dir = File.dirname(output_file)
+      File.join(output_dir, @options[:segment_filename])
+    else
+      output_dir = File.dirname(output_file)
+      basename = File.basename(output_file, '.m3u8')
+      File.join(output_dir, "#{basename}%03d.ts")
+    end
+  end
+
+  def build_ffmpeg_command(input_file, output_file, segment_file)
+    [
+      'ffmpeg',
+      '-i', quote_path(input_file),
+      '-c:v', @options[:video_codec],
+      '-c:a', @options[:audio_codec],
+      '-f', 'hls',
+      '-hls_time', @options[:hls_time].to_s,
+      '-hls_playlist_type', @options[:playlist_type],
+      '-hls_segment_filename', quote_path(segment_file),
+      quote_path(output_file)
+    ].join(' ')
+  end
+
+  def quote_path(path)
+    return path unless path.include?(' ')
+    "\"#{path}\""
+  end
+end
+
+# メイン処理
+if __FILE__ == $PROGRAM_NAME
+  converter = HLSConverter.new
+  converter.run(ARGV)
+end
